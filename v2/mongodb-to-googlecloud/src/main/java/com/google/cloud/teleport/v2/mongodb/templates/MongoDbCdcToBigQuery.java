@@ -23,8 +23,10 @@ import com.google.cloud.teleport.metadata.Template;
 import com.google.cloud.teleport.metadata.TemplateCategory;
 import com.google.cloud.teleport.metadata.TemplateParameter;
 import com.google.cloud.teleport.v2.common.UncaughtExceptionLogger;
+import com.google.cloud.teleport.v2.kafka.utils.KafkaCommonUtils;
 import com.google.cloud.teleport.v2.mongodb.options.MongoDbToBigQueryOptions.BigQueryWriteOptions;
 import com.google.cloud.teleport.v2.mongodb.options.MongoDbToBigQueryOptions.JavascriptDocumentTransformerOptions;
+import com.google.cloud.teleport.v2.mongodb.options.MongoDbToBigQueryOptions.KafkaOptions;
 import com.google.cloud.teleport.v2.mongodb.options.MongoDbToBigQueryOptions.MongoDbOptions;
 import com.google.cloud.teleport.v2.mongodb.options.MongoDbToBigQueryOptions.PubSubOptions;
 import com.google.cloud.teleport.v2.mongodb.templates.MongoDbCdcToBigQuery.Options;
@@ -32,22 +34,28 @@ import com.google.cloud.teleport.v2.options.BigQueryStorageApiStreamingOptions;
 import com.google.cloud.teleport.v2.transforms.JavascriptDocumentTransformer.TransformDocumentViaJavascript;
 import com.google.cloud.teleport.v2.utils.BigQueryIOUtils;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import javax.script.ScriptException;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
+import org.apache.beam.sdk.io.kafka.KafkaIO;
 import org.apache.beam.sdk.options.Default;
-import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.TypeDescriptors;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * The {@link MongoDbCdcToBigQuery} pipeline is a streaming pipeline which reads data pushed to
- * PubSub from MongoDB Changestream and outputs the resulting records to BigQuery.
+ * PubSub or Kafka from MongoDB Changestream and outputs the resulting records to BigQuery.
  *
  * <p>Check out <a
  * href="https://github.com/GoogleCloudPlatform/DataflowTemplates/blob/main/v2/mongodb-to-googlecloud/README_MongoDB_to_BigQuery_CDC.md">README</a>
@@ -56,10 +64,10 @@ import org.slf4j.LoggerFactory;
 @Template(
     name = "MongoDB_to_BigQuery_CDC",
     category = TemplateCategory.STREAMING,
-    displayName = "MongoDB (CDC) to BigQuery",
+    displayName = "MongoDB (CDC) to BigQuery (via Pub/Sub or Kafka)",
     description =
         "The MongoDB CDC (Change Data Capture) to BigQuery template is a streaming pipeline that works together with MongoDB change streams. "
-            + "The pipeline reads the JSON records pushed to Pub/Sub via a MongoDB change stream and writes them to BigQuery as specified by the <code>userOption</code> parameter.",
+            + "The pipeline reads the JSON records pushed to Pub/Sub topic or Kafka topic(s) via a MongoDB change stream and writes them to BigQuery as specified by the <code>userOption</code> parameter.",
     optionsClass = Options.class,
     flexContainerName = "mongodb-to-bigquery-cdc",
     documentation =
@@ -69,7 +77,8 @@ import org.slf4j.LoggerFactory;
     requirements = {
       "The target BigQuery dataset must exist.",
       "The source MongoDB instance must be accessible from the Dataflow worker machines.",
-      "The change stream pushing changes from MongoDB to Pub/Sub should be running."
+      "The change stream pushing changes from MongoDB to the source (Pub/Sub or Kafka) should be running.",
+      "If using Kafka as a source, the Kafka cluster must be accessible from the Dataflow worker machines."
     },
     streaming = true,
     supportsAtLeastOnce = true)
@@ -82,6 +91,7 @@ public class MongoDbCdcToBigQuery {
       extends PipelineOptions,
           MongoDbOptions,
           PubSubOptions,
+          KafkaOptions,
           BigQueryWriteOptions,
           JavascriptDocumentTransformerOptions,
           BigQueryStorageApiStreamingOptions {
@@ -130,13 +140,26 @@ public class MongoDbCdcToBigQuery {
     run(options);
   }
 
-  /** Pipeline to read data from PubSub and write to MongoDB. */
+  /** Pipeline to read data from source and write to MongoDB. */
   public static boolean run(Options options)
       throws ScriptException, IOException, NoSuchMethodException {
     options.setStreaming(true);
     Pipeline pipeline = Pipeline.create(options);
     String userOption = options.getUserOption();
     String inputOption = options.getInputTopic();
+
+    // Validate that either Pub/Sub or Kafka options are provided, but not both.
+    boolean pubsubProvided = options.getInputTopic() != null && !options.getInputTopic().isEmpty();
+    boolean kafkaProvided =
+        options.getKafkaBootstrapServers() != null
+            && !options.getKafkaBootstrapServers().isEmpty()
+            && options.getKafkaReadTopics() != null
+            && !options.getKafkaReadTopics().isEmpty();
+
+    if (pubsubProvided == kafkaProvided) { // either both are provided or none are
+      throw new IllegalArgumentException(
+          "Either Pub/Sub topic or Kafka bootstrap servers and topics must be provided, but not both.");
+    }
 
     TableSchema bigquerySchema;
 
@@ -159,8 +182,43 @@ public class MongoDbCdcToBigQuery {
               mongoDbUri, options.getDatabase(), options.getCollection(), options.getUserOption());
     }
 
-    pipeline
-        .apply("Read PubSub Messages", PubsubIO.readStrings().fromTopic(inputOption))
+    PCollection<String> messages;
+    if (pubsubProvided) {
+      messages =
+          pipeline
+            .apply("Read PubSub Messages", PubsubIO.readStrings().fromTopic(inputOption));
+    } else {
+      Map<String, Object> consumerConfig = new HashMap<>();
+      if (options.getKafkaConsumerConfig() != null && !options.getKafkaConsumerConfig().isEmpty()) {
+        consumerConfig = KafkaCommonUtils.parseKafkaClientConfig(options.getKafkaConsumerConfig());
+      }
+      if (options.getKafkaSaslJaasConfigSecret() != null
+          && !options.getKafkaSaslJaasConfigSecret().isEmpty()) {
+        consumerConfig.put(
+            "sasl.jaas.config",
+            maybeDecrypt(options.getKafkaSaslJaasConfigSecret(), options.getKMSEncryptionKey())
+                .get());
+      }
+      if (options.getKafkaSaslMechanism() != null && !options.getKafkaSaslMechanism().isEmpty()) {
+        consumerConfig.put("sasl.mechanism", options.getKafkaSaslMechanism());
+      }
+
+      messages =
+          pipeline.apply(
+              "Read Kafka Messages",
+              KafkaIO.<String, String>read()
+                  .withBootstrapServers(options.getKafkaBootstrapServers())
+                  .withTopics(options.getKafkaReadTopics())
+                  .withKeyDeserializer(StringDeserializer.class) // Key is ignored for now
+                  .withValueDeserializer(StringDeserializer.class)
+                  .withConsumerConfigUpdates(consumerConfig)
+                  .withoutMetadata() // We only need the message value (JSON string)
+                  .apply(
+                      "Extract Kafka Message Value",
+                      MapElements.into(TypeDescriptors.strings()).via(record -> record.getKV().getValue())));
+    }
+
+    messages
         .apply(
             "RTransform string to document",
             ParDo.of(

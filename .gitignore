@@ -25,3 +25,6 @@
 **/*.tfstate
 **/*.tfstate.backup
 **/.terraform*
+
+# Firebase Studio
+.idx/*
