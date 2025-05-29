@@ -205,7 +205,6 @@ public class SourceDbToSpannerITBase extends JDBCBaseIT {
    * @param gcsPathPrefix Prefix directory name for this DF job. Data and DLQ directories will be
    *     created under this prefix.
    * @return dataflow jobInfo object
-   * @throws IOException
    */
   protected PipelineLauncher.LaunchInfo launchDataflowJob(
       String identifierSuffix,
@@ -268,6 +267,7 @@ public class SourceDbToSpannerITBase extends JDBCBaseIT {
     } else {
       options.addEnvironment("numWorkers", 2);
     }
+    options.addEnvironment("ipConfiguration", "WORKER_IP_PRIVATE");
     // Run
     PipelineLauncher.LaunchInfo jobInfo = launchTemplate(options, false);
     assertThatPipeline(jobInfo).isRunning();

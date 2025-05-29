@@ -538,7 +538,7 @@ public class InformationSchemaScanner {
                 + " FROM information_schema.indexes AS t "
                 + " WHERE t.table_schema NOT IN "
                 + " ('information_schema', 'spanner_sys', 'pg_catalog')"
-                + " AND (t.index_type='INDEX' OR t.index_type='SEARCH') AND t.spanner_is_managed = 'NO' "
+                + " AND (t.index_type='INDEX' OR t.index_type='SEARCH' OR t.index_type='ScaNN') AND t.spanner_is_managed = 'NO' "
                 + " ORDER BY t.table_name, t.index_name");
       default:
         throw new IllegalArgumentException("Unrecognized dialect: " + dialect);
@@ -572,7 +572,8 @@ public class InformationSchemaScanner {
         if (indexType != null && ordering != null) {
           // Non-tokenlist columns should not be included in the key for Search Indexes.
           if ((indexType.equals("SEARCH") && !spannerType.contains(tokenlistType))
-              || (indexType.equals("VECTOR") && !spannerType.startsWith("ARRAY"))) {
+              || (indexType.equals("VECTOR") && !spannerType.startsWith("ARRAY"))
+              || (indexType.equals("ScaNN") && !spannerType.contains("vector length"))) {
             continue;
           }
         }
@@ -593,7 +594,9 @@ public class InformationSchemaScanner {
             indexBuilder.columns().create().name(columnName);
         // Tokenlist columns do not have ordering.
         if (spannerType != null
-            && (spannerType.equals(tokenlistType) || spannerType.startsWith("ARRAY"))) {
+            && (spannerType.equals(tokenlistType)
+                || spannerType.startsWith("ARRAY")
+                || spannerType.contains("vector length"))) {
           indexColumnsBuilder.none();
         } else if (ordering == null) {
           indexColumnsBuilder.storing();
@@ -661,7 +664,10 @@ public class InformationSchemaScanner {
           allOptions.computeIfAbsent(kv, k -> ImmutableList.builder());
 
       if (optionType.equalsIgnoreCase("STRING")) {
-        options.add(optionName + "=\"" + OPTION_STRING_ESCAPER.escape(optionValue) + "\"");
+        String quoteChar =
+            dialect == Dialect.POSTGRESQL ? POSTGRESQL_LITERAL_QUOTE : GSQL_LITERAL_QUOTE;
+        options.add(
+            optionName + "=" + quoteChar + OPTION_STRING_ESCAPER.escape(optionValue) + quoteChar);
       } else if (optionType.equalsIgnoreCase("character varying")) {
         options.add(optionName + "='" + OPTION_STRING_ESCAPER.escape(optionValue) + "'");
       } else {
@@ -1084,9 +1090,11 @@ public class InformationSchemaScanner {
       case GOOGLE_STANDARD_SQL:
         return Statement.of(
             "SELECT p.specific_schema, p.specific_name, p.parameter_name, p.data_type,"
-                + " p.parameter_default  FROM information_schema.parameters AS p WHERE"
-                + " p.specific_schema NOT IN ('INFORMATION_SCHEMA', 'SPANNER_SYS') ORDER BY"
-                + " p.specific_schema, p.specific_name, p.ordinal_position");
+                + " p.parameter_default  FROM information_schema.parameters AS p, information_schema.routines AS r"
+                + " WHERE p.specific_schema NOT IN ('INFORMATION_SCHEMA', 'SPANNER_SYS') and p.specific_name ="
+                + " r.specific_name and r.routine_type = 'FUNCTION' and r.routine_body = 'SQL' ORDER BY p.specific_schema,"
+                + " p.specific_name, p.ordinal_position");
+
       default:
         throw new IllegalArgumentException("Unrecognized dialect: " + dialect);
     }

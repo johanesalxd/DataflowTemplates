@@ -105,7 +105,7 @@ public class InformationSchemaScannerTest {
                 + " FROM information_schema.indexes AS t "
                 + " WHERE t.table_schema NOT IN "
                 + " ('information_schema', 'spanner_sys', 'pg_catalog')"
-                + " AND (t.index_type='INDEX' OR t.index_type='SEARCH') AND t.spanner_is_managed = 'NO' "
+                + " AND (t.index_type='INDEX' OR t.index_type='SEARCH' OR t.index_type='ScaNN') AND t.spanner_is_managed = 'NO' "
                 + " ORDER BY t.table_name, t.index_name"));
   }
 
@@ -162,9 +162,10 @@ public class InformationSchemaScannerTest {
         googleSQLInfoScanner.listFunctionParametersSQL().getSql(),
         equalToCompressingWhiteSpace(
             "SELECT p.specific_schema, p.specific_name, p.parameter_name, p.data_type,"
-                + " p.parameter_default  FROM information_schema.parameters AS p WHERE"
-                + " p.specific_schema NOT IN ('INFORMATION_SCHEMA', 'SPANNER_SYS') ORDER BY"
-                + " p.specific_schema, p.specific_name, p.ordinal_position"));
+                + " p.parameter_default  FROM information_schema.parameters AS p, information_schema.routines AS r"
+                + " WHERE p.specific_schema NOT IN ('INFORMATION_SCHEMA', 'SPANNER_SYS') and p.specific_name ="
+                + " r.specific_name and r.routine_type = 'FUNCTION' and r.routine_body = 'SQL' ORDER BY p.specific_schema,"
+                + " p.specific_name, p.ordinal_position"));
 
     assertThrows(
         IllegalArgumentException.class,
